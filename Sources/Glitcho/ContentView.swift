@@ -5,31 +5,48 @@ struct ContentView: View {
     @StateObject private var store = WebViewStore(url: URL(string: "https://www.twitch.tv")!)
     @State private var searchText = ""
     @State private var showSettingsPopup = false
-    @State private var currentChannel: String?
+    @State private var playbackRequest = NativePlaybackRequest(kind: .liveChannel, streamlinkTarget: "twitch.tv", channelName: nil)
     @State private var useNativePlayer = false
-    @State private var playerID = UUID() // Pour forcer le refresh
+    @State private var columnVisibility: NavigationSplitViewVisibility = .all
+    @State private var showSubscriptionPopup = false
+    @State private var subscriptionChannel: String?
+    @State private var showGiftPopup = false
+    @State private var giftChannel: String?
 
     var body: some View {
         ZStack {
             GlassBackground()
 
-            NavigationSplitView(columnVisibility: .constant(.all)) {
+            NavigationSplitView(columnVisibility: $columnVisibility) {
                 Sidebar(
                     searchText: $searchText,
                     store: store,
                     showSettingsPopup: $showSettingsPopup,
+                    onNavigate: { url in
+                        // Si on est en player natif, revenir au WebView quand l'utilisateur navigue ailleurs
+                        useNativePlayer = false
+                        store.navigate(to: url)
+                    },
                     onChannelSelected: { channelName in
-                        currentChannel = channelName
+                        playbackRequest = NativePlaybackRequest(kind: .liveChannel, streamlinkTarget: "twitch.tv/\(channelName)", channelName: channelName)
                         useNativePlayer = true
-                        playerID = UUID() // Force le refresh de la vue
                     }
                 )
                 .navigationSplitViewColumnWidth(350)
             } detail: {
                 GlassCard {
-                    if useNativePlayer, let channel = currentChannel {
-                        HybridTwitchView(channelName: channel)
-                            .id(playerID) // Force SwiftUI à recréer la vue
+                    if useNativePlayer {
+                        HybridTwitchView(
+                            playback: $playbackRequest,
+                            onOpenSubscription: { channel in
+                                subscriptionChannel = channel
+                                showSubscriptionPopup = true
+                            },
+                            onOpenGiftSub: { channel in
+                                giftChannel = channel
+                                showGiftPopup = true
+                            }
+                        )
                     } else {
                         WebViewContainer(webView: store.webView)
                     }
@@ -38,14 +55,21 @@ struct ContentView: View {
                 .padding(20)
             }
             .navigationSplitViewStyle(.prominentDetail)
-            .onChange(of: store.shouldSwitchToNativePlayer) { channelName in
-                if let channel = channelName {
-                    currentChannel = channel
+            .onChange(of: store.shouldSwitchToNativePlayback) { request in
+                if let request {
+                    if useNativePlayer, playbackRequest == request {
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                            store.shouldSwitchToNativePlayback = nil
+                        }
+                        return
+                    }
+                    // Important: tuer toute lecture web pour éviter double playback.
+                    store.prepareWebViewForNativePlayer()
+                    playbackRequest = request
                     useNativePlayer = true
-                    playerID = UUID()
                     // Réinitialiser le flag
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                        store.shouldSwitchToNativePlayer = nil
+                        store.shouldSwitchToNativePlayback = nil
                     }
                 }
             }
@@ -62,6 +86,32 @@ struct ContentView: View {
                     showSettingsPopup = false
                 }
                 .zIndex(2)
+            }
+
+            if showSubscriptionPopup, let channel = subscriptionChannel {
+                PopupPanel(
+                    title: "Subscribe",
+                    width: 760,
+                    height: 700,
+                    url: URL(string: "https://www.twitch.tv/subs/\(channel)")!,
+                    onLoadScript: subscriptionPopupScript
+                ) {
+                    showSubscriptionPopup = false
+                }
+                .zIndex(3)
+            }
+
+            if showGiftPopup, let channel = giftChannel {
+                PopupPanel(
+                    title: "Gift a Sub",
+                    width: 760,
+                    height: 700,
+                    url: URL(string: "https://www.twitch.tv/subs/\(channel)?gift=1")!,
+                    onLoadScript: subscriptionPopupScript
+                ) {
+                    showGiftPopup = false
+                }
+                .zIndex(4)
             }
         }
     }
@@ -143,19 +193,78 @@ private let settingsPopupScript = """
 })();
 """
 
+private let subscriptionPopupScript = """
+(function() {
+  const css = `
+    :root {
+      --side-nav-width: 0px !important;
+      --side-nav-width-collapsed: 0px !important;
+      --side-nav-width-expanded: 0px !important;
+      --left-nav-width: 0px !important;
+      --top-nav-height: 0px !important;
+    }
+    header,
+    .top-nav,
+    .top-nav__menu,
+    [data-a-target="top-nav-container"],
+    [data-test-selector="top-nav-container"],
+    [data-test-selector="top-nav"],
+    [data-a-target="top-nav"],
+    #sideNav,
+    [data-a-target="left-nav"],
+    [data-test-selector="left-nav"],
+    [data-a-target="side-nav"],
+    [data-a-target="side-nav-bar"],
+    [data-a-target="side-nav-bar__content"],
+    [data-a-target="side-nav-bar__content__inner"],
+    [data-a-target="side-nav-bar__overlay"],
+    [data-a-target="side-nav__content"],
+    [data-a-target="side-nav-container"],
+    [data-test-selector="side-nav"],
+    nav[aria-label="Primary Navigation"] {
+      display: none !important;
+      width: 0 !important;
+      min-width: 0 !important;
+      max-width: 0 !important;
+      opacity: 0 !important;
+      pointer-events: none !important;
+    }
+    main,
+    [data-a-target="page-layout__main"],
+    [data-a-target="page-layout__main-content"],
+    [data-a-target="content"] {
+      margin-left: 0 !important;
+      padding-left: 0 !important;
+      margin-top: 0 !important;
+      padding-top: 0 !important;
+      background: transparent !important;
+    }
+    body, #root {
+      background: transparent !important;
+    }
+  `;
+  let style = document.getElementById('tw-sub-popup-style');
+  if (!style) {
+    style = document.createElement('style');
+    style.id = 'tw-sub-popup-style';
+    style.textContent = css;
+    document.head.appendChild(style);
+  }
+})();
+"""
+
 struct Sidebar: View {
     @Binding var searchText: String
     @ObservedObject var store: WebViewStore
     @Binding var showSettingsPopup: Bool
+    var onNavigate: ((URL) -> Void)?
     var onChannelSelected: ((String) -> Void)?
 
     private let sections: [TwitchDestination] = [
         .home,
         .following,
         .browse,
-        .categories,
         .music,
-        .esports,
         .drops
     ]
 
@@ -167,12 +276,18 @@ struct Sidebar: View {
 
                     AccountSection(
                         store: store,
-                        showSettingsPopup: $showSettingsPopup
+                        showSettingsPopup: $showSettingsPopup,
+                        onNavigate: onNavigate
                     )
 
                     SearchBar(text: $searchText) {
                         let query = searchText.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
-                        store.navigate(to: URL(string: "https://www.twitch.tv/search?term=\(query)")!)
+                        let url = URL(string: "https://www.twitch.tv/search?term=\(query)")!
+                        if let onNavigate {
+                            onNavigate(url)
+                        } else {
+                            store.navigate(to: url)
+                        }
                     }
 
                     ScrollView {
@@ -184,7 +299,11 @@ struct Sidebar: View {
                                             title: destination.title,
                                             systemImage: destination.icon
                                         ) {
-                                            store.navigate(to: destination.url)
+                                            if let onNavigate {
+                                                onNavigate(destination.url)
+                                            } else {
+                                                store.navigate(to: destination.url)
+                                            }
                                         }
                                     }
                                 }
@@ -259,6 +378,7 @@ struct LogoHeader: View {
 struct AccountSection: View {
     @ObservedObject var store: WebViewStore
     @Binding var showSettingsPopup: Bool
+    var onNavigate: ((URL) -> Void)?
 
     var body: some View {
         let displayName = normalized(store.profileName) ?? normalized(store.profileLogin) ?? (store.isLoggedIn ? "Profile" : "Not signed in")
@@ -330,7 +450,12 @@ struct AccountSection: View {
                     .help("Log out")
                 } else {
                     Button {
-                        store.navigate(to: URL(string: "https://www.twitch.tv/login")!)
+                        let url = URL(string: "https://www.twitch.tv/login")!
+                        if let onNavigate {
+                            onNavigate(url)
+                        } else {
+                            store.navigate(to: url)
+                        }
                     } label: {
                         HStack(spacing: 6) {
                             Image(systemName: "person.fill")
@@ -514,27 +639,48 @@ struct SearchBar: View {
     @FocusState private var isFocused: Bool
 
     var body: some View {
-        HStack(spacing: 12) {
-            Image(systemName: "magnifyingglass")
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(isFocused ? Color.white.opacity(0.9) : Color.white.opacity(0.5))
+        func submit() {
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return }
+            if trimmed != text { text = trimmed }
+            onSubmit()
+            isFocused = false
+        }
+
+        return HStack(spacing: 12) {
+            Button(action: submit) {
+                Image(systemName: "magnifyingglass")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(isFocused ? Color.white.opacity(0.9) : Color.white.opacity(0.5))
+            }
+            .buttonStyle(.plain)
 
             TextField("Search Twitch", text: $text)
                 .textFieldStyle(.plain)
                 .font(.system(size: 13, weight: .medium))
                 .foregroundStyle(.primary)
                 .focused($isFocused)
-                .onSubmit(onSubmit)
+                .onSubmit(submit)
 
             if !text.isEmpty {
-                Button {
-                    text = ""
-                } label: {
-                    Image(systemName: "xmark.circle.fill")
-                        .font(.system(size: 14, weight: .medium))
-                        .foregroundStyle(Color.white.opacity(0.4))
+                HStack(spacing: 8) {
+                    Button(action: submit) {
+                        Image(systemName: "arrow.turn.down.left")
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(Color.white.opacity(0.55))
+                    }
+                    .buttonStyle(.plain)
+                    .help("Search")
+
+                    Button {
+                        text = ""
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.system(size: 14, weight: .medium))
+                            .foregroundStyle(Color.white.opacity(0.4))
+                    }
+                    .buttonStyle(.plain)
                 }
-                .buttonStyle(.plain)
             }
         }
         .padding(.horizontal, 14)

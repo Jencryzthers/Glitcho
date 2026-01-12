@@ -2,6 +2,20 @@ import Foundation
 import AppKit
 import WebKit
 
+struct NativePlaybackRequest: Equatable {
+    enum Kind: String, Equatable {
+        case liveChannel
+        case vod
+        case clip
+    }
+
+    let kind: Kind
+    /// Argument to pass to Streamlink (URL or "twitch.tv/<channel>").
+    let streamlinkTarget: String
+    /// Optional channel name used for chat/about panels.
+    let channelName: String?
+}
+
 struct TwitchChannel: Identifiable, Hashable {
     let id: String
     let name: String
@@ -30,12 +44,13 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
     @Published var profileLogin: String?
     @Published var profileAvatarURL: URL?
     @Published var isLoggedIn = false
-    @Published var shouldSwitchToNativePlayer: String? = nil // Nom de la chaîne à ouvrir
+    @Published var shouldSwitchToNativePlayback: NativePlaybackRequest? = nil
 
     private var observations: [NSKeyValueObservation] = []
     private var backgroundWebView: WKWebView?
     private var followedRefreshTimer: Timer?
     private var wasLoggedIn = false
+    private var lastNonChannelURL: URL?
 
     init(url: URL) {
         self.homeURL = url
@@ -90,11 +105,34 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
                 self?.pageTitle = title.isEmpty ? "Twitch" : title
             },
             webView.observe(\.url, options: [.initial, .new]) { [weak self] _, change in
-                guard let host = change.newValue??.host else {
-                    self?.pageURL = "twitch.tv"
+                guard let self else { return }
+                guard let url = change.newValue ?? nil else {
+                    self.pageURL = "twitch.tv"
                     return
                 }
-                self?.pageURL = host
+
+                if let host = url.host {
+                    self.pageURL = host
+                } else {
+                    self.pageURL = "twitch.tv"
+                }
+
+                // Twitch est une SPA: beaucoup de navigations n'entrent pas dans decidePolicyFor.
+                // On détecte ici les URLs de chaînes pour basculer vers le player natif.
+                if let request = self.nativePlaybackRequestIfNeeded(url: url) {
+                    // Stopper le player web (sinon double audio) et revenir à la page précédente non-channel.
+                    self.prepareWebViewForNativePlayer()
+                    DispatchQueue.main.async {
+                        if self.shouldSwitchToNativePlayback != request {
+                            self.shouldSwitchToNativePlayback = request
+                        }
+                    }
+                } else {
+                    // Garder en mémoire la dernière page "non-channel" pour pouvoir y revenir après un switch natif.
+                    if let host = url.host?.lowercased(), host.hasSuffix("twitch.tv") {
+                        self.lastNonChannelURL = self.normalizedTwitchURL(url)
+                    }
+                }
             }
         ]
     }
@@ -117,6 +155,29 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
 
     func navigate(to url: URL) {
         webView.load(URLRequest(url: normalizedTwitchURL(url)))
+    }
+
+    /// Stoppe toute lecture (vidéo/audio) dans le WebView et retourne à la dernière page non-channel.
+    func prepareWebViewForNativePlayer() {
+        webView.stopLoading()
+        stopWebPlayback()
+        if let lastNonChannelURL {
+            webView.load(URLRequest(url: lastNonChannelURL))
+        } else {
+            webView.load(URLRequest(url: normalizedTwitchURL(homeURL)))
+        }
+    }
+
+    private func stopWebPlayback() {
+        let js = """
+        (function() {
+          try {
+            document.querySelectorAll('video').forEach(v => { try { v.pause(); v.muted = true; } catch (e) {} });
+            document.querySelectorAll('audio').forEach(a => { try { a.pause(); a.muted = true; } catch (e) {} });
+          } catch (e) {}
+        })();
+        """
+        webView.evaluateJavaScript(js, completionHandler: nil)
     }
 
     func logout() {
@@ -153,6 +214,49 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
             components.path = "/" + parts[0]
         }
         return components.url ?? url
+    }
+
+    private func nativePlaybackRequestIfNeeded(url: URL) -> NativePlaybackRequest? {
+        guard let host = url.host?.lowercased() else { return nil }
+
+        if host == "clips.twitch.tv" {
+            let parts = url.path.split(separator: "/").map(String.init)
+            guard let slug = parts.first, !slug.isEmpty else { return nil }
+            return NativePlaybackRequest(kind: .clip, streamlinkTarget: url.absoluteString, channelName: nil)
+        }
+
+        guard host.hasSuffix("twitch.tv") else { return nil }
+
+        let normalized = normalizedTwitchURL(url)
+        let parts = normalized.path.split(separator: "/").map(String.init)
+        guard let first = parts.first, !first.isEmpty else { return nil }
+
+        // VOD: /videos/<id>
+        if first.lowercased() == "videos", parts.count >= 2 {
+            let id = parts[1]
+            if id.allSatisfy({ $0.isNumber }) {
+                return NativePlaybackRequest(kind: .vod, streamlinkTarget: normalized.absoluteString, channelName: nil)
+            }
+        }
+
+        // Clip: /clip/<slug> or /<channel>/clip/<slug>
+        if first.lowercased() == "clip", parts.count >= 2 {
+            return NativePlaybackRequest(kind: .clip, streamlinkTarget: normalized.absoluteString, channelName: nil)
+        }
+        if parts.count >= 3, parts[1].lowercased() == "clip" {
+            return NativePlaybackRequest(kind: .clip, streamlinkTarget: normalized.absoluteString, channelName: nil)
+        }
+
+        // Live channel root: /<channel>
+        let reserved: Set<String> = [
+            "directory", "downloads", "login", "logout", "search", "settings", "signup", "p",
+            "following", "browse", "drops", "subs", "inventory"
+        ]
+        let channel = first.lowercased()
+        guard !reserved.contains(channel) else { return nil }
+        guard parts.count == 1 else { return nil }
+
+        return NativePlaybackRequest(kind: .liveChannel, streamlinkTarget: "twitch.tv/\(first)", channelName: first)
     }
 
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
@@ -222,26 +326,14 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
             return
         }
         
-        // Détecter si c'est une page de chaîne (ex: twitch.tv/xqc)
-        if let host = url.host?.lowercased(), host.hasSuffix("twitch.tv") {
-            let path = url.path
-            let parts = path.split(separator: "/").map(String.init)
-            
-            // Si c'est un lien vers une chaîne (pas /directory, /videos, etc.)
-            if parts.count >= 1 && !parts[0].isEmpty {
-                let reserved = ["directory", "downloads", "login", "logout", "search", "settings", "signup", "p", "following", "browse", "videos", "drops", "subs", "inventory"]
-                let channelName = parts[0].lowercased()
-                
-                if !reserved.contains(channelName) {
-                    // C'est une chaîne ! Basculer vers le lecteur natif
-                    print("❌ [Glitcho] Detected channel: \(parts[0]) - Switching to native player")
-                    DispatchQueue.main.async {
-                        self.shouldSwitchToNativePlayer = parts[0]
-                    }
-                    decisionHandler(.cancel)
-                    return
-                }
+        if let request = nativePlaybackRequestIfNeeded(url: url) {
+            print("❌ [Glitcho] Detected playback: \(request.kind.rawValue) - Switching to native player")
+            prepareWebViewForNativePlayer()
+            DispatchQueue.main.async {
+                self.shouldSwitchToNativePlayback = request
             }
+            decisionHandler(.cancel)
+            return
         }
 
         decisionHandler(.allow)
@@ -653,6 +745,16 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
             'ads.twitch.tv',
             'ads-api.twitter.com',
             'ads-twitter.com',
+            'criteo.com',
+            'criteo.net',
+            'taboola.com',
+            'outbrain.com',
+            'smartadserver.com',
+            'adform.net',
+            'adsrvr.org',
+            'pubmatic.com',
+            'openx.net',
+            'doubleverify.com',
             // Analytics & tracking
             'google-analytics.com',
             'analytics.google.com',
@@ -701,6 +803,8 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
               '/analytics',
               '/pixel',
               '/beacon',
+              'utm_source=',
+              'utm_medium=',
               '_ad.',
               '_ads.',
               'ad_',
@@ -899,6 +1003,13 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
             [id*="ad-overlay"],
             [class*="AdBanner"],
             [class*="ad-banner"],
+            /* Display ads on directory/browse */
+            [data-a-target*="amazon"],
+            [data-test-selector*="amazon"],
+            [data-a-target*="display-ad"],
+            [data-test-selector*="display-ad"],
+            [aria-label*="Advertisement"],
+            [aria-label*="advertisement"],
             
             /* Twitch-specific ad elements */
             [data-a-target*="ad-"],
@@ -1041,6 +1152,67 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
           
           // Aggressively remove ad elements every second
           setInterval(() => {
+            function normalize(s) {
+              return (s || '').toLowerCase().replace(/\\s+/g, ' ').trim();
+            }
+
+            function looksLikeAmazonAd(el) {
+              try {
+                const t = normalize(el.textContent);
+                if (t.includes('shop on amazon') || t.includes('add to cart') || t.includes('prime')) { return true; }
+                if (t.includes('dyson') && t.includes('$')) { return true; } // common banner pattern
+                const imgs = el.querySelectorAll ? el.querySelectorAll('img') : [];
+                for (const img of imgs) {
+                  const alt = normalize(img.getAttribute('alt') || '');
+                  const src = normalize(img.getAttribute('src') || '');
+                  if (alt.includes('prime') || alt.includes('amazon') || src.includes('amazon')) { return true; }
+                }
+              } catch (_) {}
+              return false;
+            }
+
+            function hasExternalLink(el) {
+              try {
+                const links = el.querySelectorAll('a[href]');
+                for (const a of links) {
+                  const href = a.getAttribute('href') || '';
+                  if (!href) { continue; }
+                  if (href.startsWith('http') && !href.includes('twitch.tv')) { return true; }
+                  // Ads are often external or go through a twitch redirect
+                  if (href.includes('amazon.') || href.includes('amzn.to') || href.includes('amazon')) { return true; }
+                  if (href.includes('/redirect') && (href.includes('amazon') || href.includes('amzn'))) { return true; }
+                }
+              } catch (_) {}
+              return false;
+            }
+
+            function hasAdIframe(el) {
+              try {
+                const iframes = el.querySelectorAll('iframe[src]');
+                for (const iframe of iframes) {
+                  const src = (iframe.getAttribute('src') || '').toLowerCase();
+                  if (!src) { continue; }
+                  if (shouldBlockRequest(src)) { return true; }
+                  if (src.includes('amazon-adsystem') || src.includes('doubleclick') || src.includes('googlesyndication')) { return true; }
+                }
+              } catch (_) {}
+              return false;
+            }
+
+            function removeLikelyAdContainer(seed) {
+              let cur = seed;
+              for (let i = 0; i < 10 && cur; i++) {
+                const rect = cur.getBoundingClientRect ? cur.getBoundingClientRect() : null;
+                const okSize = rect && rect.width >= 240 && rect.height >= 50 && rect.height <= 650;
+                if (okSize && (hasExternalLink(cur) || hasAdIframe(cur) || looksLikeAmazonAd(cur))) {
+                  cur.remove();
+                  return true;
+                }
+                cur = cur.parentElement;
+              }
+              return false;
+            }
+
             // Remove any elements matching ad patterns
             const adSelectors = [
               '[data-a-target*="ad"]',
@@ -1049,7 +1221,9 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
               '[class*="Ad"]',
               '[id*="ad-"]',
               '.sponsored',
-              '[data-a-target="sponsorship"]'
+              '[data-a-target="sponsorship"]',
+              '[data-a-target*="amazon"]',
+              '[data-test-selector*="amazon"]'
             ];
             
             adSelectors.forEach(selector => {
@@ -1061,13 +1235,57 @@ final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WK
                   if (text.includes('advertisement') || 
                       text.includes('sponsored') || 
                       text.includes('ad:') ||
+                      text.trim() === 'ad' ||
+                      text.includes('shop on amazon') ||
+                      text.includes('add to cart') ||
+                      text.includes('shop now') ||
+                      text.includes('learn more') ||
                       el.querySelector('iframe[src*="ad"]') ||
+                      el.querySelector('iframe[src*="amazon"]') ||
                       el.className.match(/\\b(ad|ads|adv|banner|sponsor)\\b/i)) {
                     el.remove();
                   }
                 });
               } catch (e) {}
             });
+
+            // Fallback: remove Amazon display ad cards that don't match selectors.
+            try {
+              const triggers = new Set(['shop on amazon', 'add to cart', 'shop now', 'learn more']);
+
+              const candidates = Array.from(document.querySelectorAll('a,button,span'));
+              candidates.forEach(node => {
+                const t = normalize(node.textContent);
+                if (!t) { return; }
+                const hit = Array.from(triggers).some(k => t.includes(k)) || t === 'ad';
+                if (!hit) { return; }
+
+                removeLikelyAdContainer(node);
+              });
+            } catch (e) {}
+
+            // Fallback: remove generic "Ad" badge blocks (works across Home/Following/Browse).
+            try {
+              const badgeCandidates = Array.from(document.querySelectorAll('[aria-label],span,div'))
+                .filter(el => {
+                  const aria = normalize(el.getAttribute && el.getAttribute('aria-label'));
+                  const txt = normalize(el.textContent);
+                  return aria === 'ad' || aria.includes('advertisement') || txt === 'ad' || txt === 'advertisement';
+                });
+              badgeCandidates.forEach(badge => {
+                removeLikelyAdContainer(badge);
+              });
+            } catch (e) {}
+
+            // Fallback: remove "Shop on Amazon" / "Prime" blocks anywhere (tends to be ads).
+            try {
+              const any = Array.from(document.querySelectorAll('button,span,div,a'))
+                .filter(el => {
+                  const txt = normalize(el.textContent);
+                  return txt.includes('shop on amazon') || txt.includes('add to cart') || txt.includes('prime');
+                });
+              any.forEach(node => { removeLikelyAdContainer(node); });
+            } catch (e) {}
           }, 1000);
 
           console.log('[Enhanced Adblock] Initialized successfully with uBlock-inspired rules');
