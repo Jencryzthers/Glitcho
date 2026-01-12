@@ -1,0 +1,1329 @@
+import Foundation
+import AppKit
+import WebKit
+
+struct TwitchChannel: Identifiable, Hashable {
+    let id: String
+    let name: String
+    let url: URL
+    let thumbnailURL: URL?
+}
+
+struct TwitchProfile {
+    let name: String?
+    let avatarURL: URL?
+    let isLoggedIn: Bool
+}
+
+final class WebViewStore: NSObject, ObservableObject, WKScriptMessageHandler, WKNavigationDelegate {
+    let webView: WKWebView
+    let homeURL: URL
+
+    @Published var canGoBack = false
+    @Published var canGoForward = false
+    @Published var isLoading = false
+    @Published var estimatedProgress: Double = 0
+    @Published var pageTitle = "Twitch"
+    @Published var pageURL: String = "twitch.tv"
+    @Published var followedLive: [TwitchChannel] = []
+    @Published var profileName: String?
+    @Published var profileLogin: String?
+    @Published var profileAvatarURL: URL?
+    @Published var isLoggedIn = false
+    @Published var shouldSwitchToNativePlayer: String? = nil // Nom de la chaîne à ouvrir
+
+    private var observations: [NSKeyValueObservation] = []
+    private var backgroundWebView: WKWebView?
+    private var followedRefreshTimer: Timer?
+    private var wasLoggedIn = false
+
+    init(url: URL) {
+        self.homeURL = url
+
+        let config = WKWebViewConfiguration()
+        let contentController = WKUserContentController()
+        config.userContentController = contentController
+        config.websiteDataStore = .default()
+        config.defaultWebpagePreferences.allowsContentJavaScript = true
+        config.mediaTypesRequiringUserActionForPlayback = []
+
+        let webView = WKWebView(frame: .zero, configuration: config)
+        webView.setValue(false, forKey: "drawsBackground")
+        if #available(macOS 12.0, *) {
+            webView.underPageBackgroundColor = .clear
+        }
+        webView.allowsBackForwardNavigationGestures = true
+        webView.customUserAgent = Self.safariUserAgent
+        self.webView = webView
+
+        super.init()
+
+        contentController.add(self, name: "followedLive")
+        contentController.add(self, name: "profile")
+        contentController.addUserScript(Self.adBlockScript)
+        contentController.addUserScript(Self.codecWorkaroundScript)
+        contentController.addUserScript(Self.hideChromeScript)
+        contentController.addUserScript(Self.ensureLiveStreamScript)
+        contentController.addUserScript(Self.followedLiveScript)
+        contentController.addUserScript(Self.profileScript)
+        contentController.addUserScript(Self.autoPlayScript)
+        webView.navigationDelegate = self
+        webView.load(URLRequest(url: normalizedTwitchURL(url)))
+        backgroundWebView = makeBackgroundWebView()
+        loadFollowedLiveInBackground()
+
+        observations = [
+            webView.observe(\.canGoBack, options: [.initial, .new]) { [weak self] _, change in
+                self?.canGoBack = change.newValue ?? false
+            },
+            webView.observe(\.canGoForward, options: [.initial, .new]) { [weak self] _, change in
+                self?.canGoForward = change.newValue ?? false
+            },
+            webView.observe(\.isLoading, options: [.initial, .new]) { [weak self] _, change in
+                self?.isLoading = change.newValue ?? false
+            },
+            webView.observe(\.estimatedProgress, options: [.initial, .new]) { [weak self] _, change in
+                self?.estimatedProgress = change.newValue ?? 0
+            },
+            webView.observe(\.title, options: [.initial, .new]) { [weak self] _, change in
+                let title = (change.newValue ?? nil) ?? "Twitch"
+                self?.pageTitle = title.isEmpty ? "Twitch" : title
+            },
+            webView.observe(\.url, options: [.initial, .new]) { [weak self] _, change in
+                guard let host = change.newValue??.host else {
+                    self?.pageURL = "twitch.tv"
+                    return
+                }
+                self?.pageURL = host
+            }
+        ]
+    }
+
+    func goBack() {
+        webView.goBack()
+    }
+
+    func goForward() {
+        webView.goForward()
+    }
+
+    func reload() {
+        webView.reload()
+    }
+
+    func goHome() {
+        webView.load(URLRequest(url: normalizedTwitchURL(homeURL)))
+    }
+
+    func navigate(to url: URL) {
+        webView.load(URLRequest(url: normalizedTwitchURL(url)))
+    }
+
+    func logout() {
+        let dataStore = WKWebsiteDataStore.default()
+        let types = WKWebsiteDataStore.allWebsiteDataTypes()
+
+        func matchesTwitch(_ record: WKWebsiteDataRecord) -> Bool {
+            let name = record.displayName.lowercased()
+            return name.contains("twitch") || name.contains("ttvnw") || name.contains("jtv")
+        }
+
+        dataStore.fetchDataRecords(ofTypes: types) { [weak self] records in
+            let toDelete = records.filter(matchesTwitch)
+            dataStore.removeData(ofTypes: types, for: toDelete) {
+                DispatchQueue.main.async {
+                    self?.profileName = nil
+                    self?.profileLogin = nil
+                    self?.profileAvatarURL = nil
+                    self?.isLoggedIn = false
+                    self?.wasLoggedIn = false
+                    self?.followedLive = []
+                    self?.webView.load(URLRequest(url: URL(string: "https://www.twitch.tv")!))
+                    self?.backgroundWebView?.load(URLRequest(url: URL(string: "https://www.twitch.tv/following")!))
+                }
+            }
+        }
+    }
+
+    private func normalizedTwitchURL(_ url: URL) -> URL {
+        guard let host = url.host?.lowercased(), host.hasSuffix("twitch.tv") else { return url }
+        guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return url }
+        let parts = components.path.split(separator: "/").map(String.init)
+        if parts.count == 2, parts[1].lowercased() == "home" {
+            components.path = "/" + parts[0]
+        }
+        return components.url ?? url
+    }
+
+    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        switch message.name {
+        case "followedLive":
+            guard let items = message.body as? [[String: String]] else { return }
+
+            let channels = items.compactMap { item -> TwitchChannel? in
+                guard let urlString = item["url"], let url = URL(string: urlString) else { return nil }
+                let normalizedURL = normalizedTwitchURL(url)
+                let name = item["name"]?.trimmingCharacters(in: .whitespacesAndNewlines)
+                let displayName = (name?.isEmpty == false) ? name! : normalizedURL.lastPathComponent
+                let thumb = item["thumbnail"].flatMap { URL(string: $0) }
+                return TwitchChannel(id: urlString, name: displayName, url: normalizedURL, thumbnailURL: thumb)
+            }
+
+            if !channels.isEmpty {
+                DispatchQueue.main.async {
+                    self.followedLive = channels
+                }
+            }
+        case "profile":
+            guard let dict = message.body as? [String: String] else { return }
+            let name = (dict["displayName"] ?? dict["name"])?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let login = dict["login"]?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let avatar = dict["avatar"].flatMap { URL(string: $0) }
+            let loggedIn = dict["loggedIn"] == "true"
+            DispatchQueue.main.async {
+                if loggedIn {
+                    self.profileName = name?.isEmpty == false ? name : nil
+                    self.profileLogin = login?.isEmpty == false ? login : nil
+                    self.profileAvatarURL = avatar
+                } else {
+                    self.profileName = nil
+                    self.profileLogin = nil
+                    self.profileAvatarURL = nil
+                }
+                self.isLoggedIn = loggedIn
+                if loggedIn && !self.wasLoggedIn {
+                    self.loadFollowedLiveInBackground()
+                }
+                self.wasLoggedIn = loggedIn
+            }
+        default:
+            return
+        }
+    }
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        webView.evaluateJavaScript(Self.hideChromeScriptSource, completionHandler: nil)
+    }
+
+    func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+        guard navigationAction.targetFrame?.isMainFrame != false else {
+            decisionHandler(.allow)
+            return
+        }
+        guard let url = navigationAction.request.url else {
+            decisionHandler(.allow)
+            return
+        }
+
+        let normalized = normalizedTwitchURL(url)
+        if normalized != url {
+            decisionHandler(.cancel)
+            webView.load(URLRequest(url: normalized))
+            return
+        }
+        
+        // Détecter si c'est une page de chaîne (ex: twitch.tv/xqc)
+        if let host = url.host?.lowercased(), host.hasSuffix("twitch.tv") {
+            let path = url.path
+            let parts = path.split(separator: "/").map(String.init)
+            
+            // Si c'est un lien vers une chaîne (pas /directory, /videos, etc.)
+            if parts.count >= 1 && !parts[0].isEmpty {
+                let reserved = ["directory", "downloads", "login", "logout", "search", "settings", "signup", "p", "following", "browse", "videos", "drops", "subs", "inventory"]
+                let channelName = parts[0].lowercased()
+                
+                if !reserved.contains(channelName) {
+                    // C'est une chaîne ! Basculer vers le lecteur natif
+                    print("❌ [Glitcho] Detected channel: \(parts[0]) - Switching to native player")
+                    DispatchQueue.main.async {
+                        self.shouldSwitchToNativePlayer = parts[0]
+                    }
+                    decisionHandler(.cancel)
+                    return
+                }
+            }
+        }
+
+        decisionHandler(.allow)
+    }
+
+    private func makeBackgroundWebView() -> WKWebView {
+        let config = WKWebViewConfiguration()
+        let contentController = WKUserContentController()
+        config.userContentController = contentController
+        config.websiteDataStore = .default()
+        config.defaultWebpagePreferences.allowsContentJavaScript = true
+        config.mediaTypesRequiringUserActionForPlayback = []
+
+        contentController.add(self, name: "followedLive")
+        contentController.add(self, name: "profile")
+        contentController.addUserScript(Self.adBlockScript)
+        contentController.addUserScript(Self.codecWorkaroundScript)
+        contentController.addUserScript(Self.ensureLiveStreamScript)
+        contentController.addUserScript(Self.followedLiveScript)
+        contentController.addUserScript(Self.profileScript)
+
+        let webView = WKWebView(frame: .zero, configuration: config)
+        webView.setValue(false, forKey: "drawsBackground")
+        if #available(macOS 12.0, *) {
+            webView.underPageBackgroundColor = .clear
+        }
+        webView.customUserAgent = Self.safariUserAgent
+        webView.navigationDelegate = self
+        return webView
+    }
+
+    private func loadFollowedLiveInBackground() {
+        guard let backgroundWebView else { return }
+        let url = URL(string: "https://www.twitch.tv/following")!
+        backgroundWebView.load(URLRequest(url: url))
+
+        followedRefreshTimer?.invalidate()
+        followedRefreshTimer = Timer.scheduledTimer(withTimeInterval: 120, repeats: true) { [weak self] _ in
+            self?.backgroundWebView?.reload()
+        }
+    }
+
+    private static let hideChromeScriptSource = """
+        (function() {
+          document.documentElement.setAttribute('data-twitchglass', '1');
+          
+          // Détection du type de page
+          function isChannelPage() {
+            const path = window.location.pathname;
+            // Page de chaîne si le path est /username (pas /directory, /videos, etc.)
+            return path.split('/').filter(Boolean).length === 1 && 
+                   !path.includes('/directory') && 
+                   !path.includes('/videos') &&
+                   !path.includes('/settings') &&
+                   !path.includes('/search') &&
+                   path !== '/';
+          }
+          
+          const css = `
+            :root {
+              --side-nav-width: 0px !important;
+              --side-nav-width-collapsed: 0px !important;
+              --side-nav-width-expanded: 0px !important;
+              --left-nav-width: 0px !important;
+              --top-nav-height: 0px !important;
+              --tw-glass-bg: rgba(20, 20, 24, 0.55);
+              --tw-glass-border: rgba(255, 255, 255, 0.08);
+              --tw-glass-highlight: rgba(255, 255, 255, 0.18);
+              --color-background-base: transparent !important;
+              --color-background-body: transparent !important;
+              --color-background-alt: transparent !important;
+              --color-background-float: rgba(18, 18, 22, 0.45) !important;
+            }
+            html, body {
+              background: transparent !important;
+              background-color: transparent !important;
+            }
+            /* Masquer la barre de navigation Twitch */
+            header,
+            .top-nav,
+            .top-nav__menu,
+            [data-a-target="top-nav-container"],
+            [data-test-selector="top-nav-container"],
+            [data-test-selector="top-nav"],
+            [data-a-target="top-nav"],
+            [data-a-target="top-nav-search-input"],
+            [data-a-target="top-nav-search-input-group"] {
+              display: none !important;
+              height: 0 !important;
+              min-height: 0 !important;
+              opacity: 0 !important;
+              pointer-events: none !important;
+            }
+            /* Masquer la sidebar gauche de Twitch */
+            [data-test-selector="left-nav"],
+            #sideNav,
+            [data-a-target="left-nav"],
+            [data-a-target="side-nav-bar"],
+            [data-a-target="side-nav"],
+            [data-a-target="side-nav__content"],
+            [data-a-target="side-nav-container"],
+            [data-a-target="side-nav-bar__content"],
+            [data-a-target="side-nav-bar__content__inner"],
+            [data-test-selector="side-nav"],
+            nav[aria-label="Primary Navigation"] {
+              display: none !important;
+              width: 0 !important;
+              min-width: 0 !important;
+              max-width: 0 !important;
+              opacity: 0 !important;
+              pointer-events: none !important;
+            }
+            /* Ajuster le contenu principal */
+            main, .root-scrollable, [data-a-target="content"], [data-test-selector="main-page-scrollable-area"] {
+              margin-left: 0 !important;
+              padding-left: 0 !important;
+              margin-top: 0 !important;
+              padding-top: 0 !important;
+            }
+            body, #root {
+              background: transparent !important;
+            }
+            .tw-root,
+            .tw-root--theme-dark,
+            .tw-root--theme-light,
+            .twilight-minimal-root {
+              background: transparent !important;
+              background-color: transparent !important;
+            }
+            /* Sur les pages de chaîne, garder le chat et les infos visibles */
+            body.channel-page [data-a-target="video-chat"],
+            body.channel-page [data-a-target="right-column"],
+            body.channel-page [data-a-target="channel-info-content"],
+            body.channel-page [data-a-target="stream-info-card"],
+            body.channel-page [data-a-target="chat-shell"],
+            body.channel-page aside,
+            body.channel-page [role="complementary"] {
+              display: block !important;
+              opacity: 1 !important;
+              visibility: visible !important;
+            }
+            [data-a-target="preview-card"],
+            [data-a-target="preview-card-thumbnail-link"],
+            [data-a-target="preview-card-image-link"] {
+              border-radius: 14px !important;
+              overflow: hidden !important;
+            }
+            [data-a-target="preview-card"] {
+              background: var(--tw-glass-bg) !important;
+              border: 1px solid var(--tw-glass-border) !important;
+              box-shadow: none !important;
+            }
+            [data-a-target="preview-card"] img {
+              border-radius: 12px !important;
+            }
+            [data-a-target="player"] video,
+            video {
+              border-radius: 16px !important;
+              overflow: hidden !important;
+            }
+            [data-a-target="follow-button"],
+            [data-a-target="subscribe-button"] {
+              border-radius: 999px !important;
+              border: 1px solid var(--tw-glass-highlight) !important;
+              background: rgba(25, 25, 30, 0.45) !important;
+              box-shadow: none !important;
+            }
+          `;
+          
+          if (!document.getElementById('twitchglass-style')) {
+            const style = document.createElement('style');
+            style.id = 'twitchglass-style';
+            style.appendChild(document.createTextNode(css));
+            document.documentElement.appendChild(style);
+          }
+          
+          // Ajouter une classe au body pour identifier les pages de chaîne
+          function updatePageType() {
+            if (isChannelPage()) {
+              document.body.classList.add('channel-page');
+            } else {
+              document.body.classList.remove('channel-page');
+            }
+          }
+
+          function hideNavigation() {
+            // Masquer uniquement la navigation Twitch, pas le contenu
+            const topNav = document.querySelectorAll(
+              'header, .top-nav, [data-a-target="top-nav-container"]'
+            );
+            topNav.forEach(el => {
+              el.style.display = 'none';
+              el.style.height = '0';
+              el.style.minHeight = '0';
+              el.style.opacity = '0';
+              el.style.pointerEvents = 'none';
+            });
+            
+            const leftRails = document.querySelectorAll(
+              '[data-a-target*="side-nav"], [data-a-target="left-nav"], [data-test-selector="left-nav"], nav[aria-label="Primary Navigation"]'
+            );
+            leftRails.forEach(el => {
+              el.style.display = 'none';
+              el.style.width = '0';
+              el.style.minWidth = '0';
+              el.style.maxWidth = '0';
+              el.style.opacity = '0';
+              el.style.pointerEvents = 'none';
+            });
+            
+            updatePageType();
+          }
+
+          hideNavigation();
+          updatePageType();
+          
+          const observer = new MutationObserver(() => {
+            hideNavigation();
+          });
+          observer.observe(document.documentElement, { childList: true, subtree: true });
+          
+          // Détecter les changements d'URL (navigation SPA)
+          let lastUrl = location.href;
+          new MutationObserver(() => {
+            const url = location.href;
+            if (url !== lastUrl) {
+              lastUrl = url;
+              updatePageType();
+            }
+          }).observe(document, { subtree: true, childList: true });
+        })();
+        """
+
+    private static let hideChromeScript = WKUserScript(
+        source: hideChromeScriptSource,
+        injectionTime: .atDocumentEnd,
+        forMainFrameOnly: true
+    )
+
+    private static let ensureLiveStreamScript = WKUserScript(
+        source: """
+        (function() {
+          try {
+            const host = (location && location.host) ? location.host : '';
+            if (!host.endsWith('twitch.tv')) { return; }
+          } catch (_) { return; }
+
+          if (window.__twitchglass_ensure_live) { return; }
+          window.__twitchglass_ensure_live = true;
+
+          function parts() {
+            return (location.pathname || '').split('/').filter(Boolean);
+          }
+
+          function isReserved(name) {
+            const reserved = new Set(['directory','downloads','login','logout','search','settings','signup','p']);
+            return reserved.has((name || '').toLowerCase());
+          }
+
+          function redirectIfHome() {
+            const p = parts();
+            if (p.length === 2 && p[1].toLowerCase() === 'home' && !isReserved(p[0])) {
+              location.replace('https://www.twitch.tv/' + p[0]);
+              return true;
+            }
+            return false;
+          }
+
+          function isChannelRoot() {
+            const p = parts();
+            return p.length === 1 && !isReserved(p[0]);
+          }
+
+          function clickWatchLive() {
+            if (!isChannelRoot()) { return; }
+            if (document.querySelector('video')) { return; }
+
+            const direct = document.querySelector('[data-a-target="watch-live-button"], [data-test-selector="watch-live-button"]');
+            if (direct && typeof direct.click === 'function') {
+              direct.click();
+              return;
+            }
+
+            const candidates = Array.from(document.querySelectorAll('a,button')).filter(el => {
+              if (!el || typeof el.click !== 'function') { return false; }
+              if (el.offsetParent === null) { return false; }
+              const txt = (el.textContent || '').trim().toLowerCase();
+              return txt.includes('watch live') || txt.includes('regarder en direct') || txt.includes('en direct');
+            });
+            if (candidates.length) {
+              candidates[0].click();
+            }
+          }
+
+          if (redirectIfHome()) { return; }
+          setTimeout(redirectIfHome, 250);
+          setTimeout(clickWatchLive, 1200);
+          setTimeout(clickWatchLive, 3000);
+        })();
+        """,
+        injectionTime: .atDocumentEnd,
+        forMainFrameOnly: true
+    )
+
+    private static let followedLiveScript = WKUserScript(
+        source: """
+        (function() {
+          function extractFromFollowing(map) {
+            if (!(location.pathname.includes('/following') || location.pathname.includes('/directory/following'))) {
+              return;
+            }
+            const cards = Array.from(document.querySelectorAll(
+              '[data-a-target="preview-card"], [data-test-selector="live-channel-card"], article'
+            ));
+            cards.forEach(card => {
+              const link = card.querySelector('a[data-a-target="preview-card-channel-link"], a[data-a-target="preview-card-title-link"], a[href^="/"]');
+              if (!link) { return; }
+              let href = link.getAttribute('href');
+              if (!href || !href.startsWith('/') || href.startsWith('/directory') || href.startsWith('/videos')) { return; }
+              if (/^\\/[^/]+\\/home\\/?$/.test(href)) {
+                href = href.replace(/\\/home\\/?$/, '');
+              }
+              const url = 'https://www.twitch.tv' + href;
+              const name = link.getAttribute('title') || link.getAttribute('aria-label') || link.textContent || '';
+              let thumb = '';
+              const img = card.querySelector('img');
+              if (img && img.getAttribute('src')) {
+                thumb = img.getAttribute('src');
+              }
+              if (!map.has(url)) {
+                map.set(url, { name: name.trim(), url, thumbnail: thumb });
+              }
+            });
+          }
+
+          function extractFromSideNav(map) {
+            const containers = document.querySelectorAll(
+              '[data-a-target*="side-nav"], [data-test-selector="side-nav"], nav[aria-label="Primary Navigation"]'
+            );
+            containers.forEach(container => {
+              const links = Array.from(container.querySelectorAll('a[href^="/"]'));
+              links.forEach(link => {
+                const href = link.getAttribute('href');
+                if (!href || !href.startsWith('/') || href.startsWith('/directory') || href.startsWith('/videos')) { return; }
+                let cleanedHref = href;
+                if (/^\\/[^/]+\\/home\\/?$/.test(cleanedHref)) {
+                  cleanedHref = cleanedHref.replace(/\\/home\\/?$/, '');
+                }
+                const url = 'https://www.twitch.tv' + cleanedHref;
+                let name = link.getAttribute('aria-label') || link.getAttribute('title') || link.textContent || '';
+                name = name.replace('→', '').replace('›', '').trim();
+                if (name.toLowerCase().includes('use the right')) {
+                  name = '';
+                }
+                if (!name || name.toLowerCase() === 'show more') {
+                  const parts = cleanedHref.split('/').filter(Boolean);
+                  name = parts.length ? parts[0] : '';
+                }
+                if (!name.trim()) { return; }
+                let thumb = '';
+                const img = link.querySelector('img');
+                if (img && img.getAttribute('src')) {
+                  thumb = img.getAttribute('src');
+                }
+                if (!map.has(url)) {
+                  map.set(url, { name: name.trim(), url, thumbnail: thumb });
+                }
+              });
+            });
+          }
+
+          function extract() {
+            const map = new Map();
+            extractFromFollowing(map);
+            extractFromSideNav(map);
+            if (map.size > 0) {
+              window.webkit.messageHandlers.followedLive.postMessage(Array.from(map.values()));
+            }
+          }
+
+          extract();
+          setInterval(extract, 5000);
+        })();
+        """,
+        injectionTime: .atDocumentEnd,
+        forMainFrameOnly: true
+    )
+
+    static let safariUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.15"
+
+    private static let adBlockScript = WKUserScript(
+        source: """
+        (function() {
+          if (window.__purple_adblock) { return; }
+          window.__purple_adblock = true;
+
+          console.log('[Enhanced Adblock] Initializing with uBlock-inspired rules...');
+
+          // Enhanced Adblock - Network request blocking (inspired by uBlock Origin)
+          const blockedDomains = [
+            // Ad servers
+            'doubleclick.net',
+            'googlesyndication.com',
+            'googleadservices.com',
+            'amazon-adsystem.com',
+            'advertising.amazon.com',
+            'pubads.g.doubleclick.net',
+            'adservice.google.com',
+            'ads.twitch.tv',
+            'ads-api.twitter.com',
+            'ads-twitter.com',
+            // Analytics & tracking
+            'google-analytics.com',
+            'analytics.google.com',
+            'googletagmanager.com',
+            'googletagservices.com',
+            'stats.g.doubleclick.net',
+            'facebook.com/tr',
+            'connect.facebook.net',
+            'pixel.facebook.com',
+            'scorecardresearch.com',
+            'comscore.com',
+            // Twitch-specific ad domains
+            'pubads.twitch.tv',
+            'ttvnw.net/ads',
+            'video-weaver.twitch.tv/ads',
+            // Common ad/tracking patterns
+            'adnxs.com',
+            'rubiconproject.com',
+            'indexww.com',
+            'casalemedia.com',
+            'adsafeprotected.com',
+            'moatads.com',
+            'krxd.net'
+          ];
+
+          function shouldBlockRequest(url) {
+            if (!url || typeof url !== 'string') return false;
+            const lowerUrl = url.toLowerCase();
+            
+            // Check against blocked domains
+            for (const domain of blockedDomains) {
+              if (lowerUrl.includes(domain)) {
+                console.log('[Enhanced Adblock] Blocked domain:', domain, 'in', url);
+                return true;
+              }
+            }
+            
+            // Block common ad patterns in URLs
+            const adPatterns = [
+              '/ad/',
+              '/ads/',
+              '/advert',
+              '/banner',
+              '/sponsor',
+              '/tracking',
+              '/analytics',
+              '/pixel',
+              '/beacon',
+              '_ad.',
+              '_ads.',
+              'ad_',
+              'ads_'
+            ];
+            
+            for (const pattern of adPatterns) {
+              if (lowerUrl.includes(pattern)) {
+                console.log('[Enhanced Adblock] Blocked pattern:', pattern, 'in', url);
+                return true;
+              }
+            }
+            
+            return false;
+          }
+
+          // Purple Adblock - Playlist filtering
+          const originalFetch = window.fetch;
+          const originalXHROpen = XMLHttpRequest.prototype.open;
+          const originalXHRSend = XMLHttpRequest.prototype.send;
+
+          // Function to filter M3U8 playlists
+          function filterM3U8Playlist(playlistText) {
+            if (!playlistText || typeof playlistText !== 'string') return playlistText;
+            
+            const lines = playlistText.split('\n');
+            const filtered = [];
+            let skipNext = false;
+            
+            for (let i = 0; i < lines.length; i++) {
+              const line = lines[i];
+              
+              // Detect ad segments
+              if (line.includes('#EXT-X-DATERANGE') && 
+                  (line.includes('stitched-ad') || 
+                   line.includes('AMAZON') || 
+                   line.includes('AD-') ||
+                   line.includes('commercial'))) {
+                console.log('[Purple Adblock] Filtered ad marker:', line);
+                skipNext = true;
+                continue;
+              }
+              
+              // Skip the segment URL after an ad marker
+              if (skipNext && !line.startsWith('#')) {
+                console.log('[Purple Adblock] Skipped ad segment:', line);
+                skipNext = false;
+                continue;
+              }
+              
+              // Filter out ad-related tags
+              if (line.includes('#EXT-X-DISCONTINUITY') && skipNext) {
+                skipNext = false;
+                continue;
+              }
+              
+              filtered.push(line);
+            }
+            
+            return filtered.join('\n');
+          }
+
+          // Override fetch for playlist requests + ad blocking
+          window.fetch = async function(resource, init) {
+            const url = typeof resource === 'string' ? resource : resource.url;
+            
+            // Block ad/tracking requests
+            if (shouldBlockRequest(url)) {
+              console.log('[Enhanced Adblock] Fetch blocked:', url);
+              return Promise.reject(new Error('Blocked by Enhanced Adblock'));
+            }
+            
+            try {
+              // Intercept playlist requests
+              if (url && (url.includes('.m3u8') || url.includes('playlist'))) {
+                console.log('[Purple Adblock] Intercepting playlist:', url);
+                
+                const response = await originalFetch.apply(this, arguments);
+                
+                if (response.ok && url.includes('.m3u8')) {
+                  const text = await response.text();
+                  const filtered = filterM3U8Playlist(text);
+                  
+                  return new Response(filtered, {
+                    status: response.status,
+                    statusText: response.statusText,
+                    headers: response.headers
+                  });
+                }
+                
+                return response;
+              }
+              
+              // Filter GraphQL ad operations
+              if (url && url.includes('gql.twitch.tv/gql') && init && init.body) {
+                try {
+                  const body = JSON.parse(init.body);
+                  const adOperations = [
+                    'VideoPlayerStreamInfoOverlayChannel',
+                    'ComscoreStreamingQuery',
+                    'ChannelShellQuery',
+                    'VideoAdUI'
+                  ];
+                  
+                  if (Array.isArray(body)) {
+                    const filtered = body.filter(item => {
+                      return !adOperations.includes(item.operationName || '');
+                    });
+                    
+                    if (filtered.length !== body.length) {
+                      console.log('[Purple Adblock] Filtered GraphQL ad operations');
+                      init.body = JSON.stringify(filtered);
+                    }
+                  }
+                } catch (e) {}
+              }
+            } catch (e) {
+              console.error('[Purple Adblock] Error:', e);
+            }
+            
+            return originalFetch.apply(this, arguments);
+          };
+
+          // Override XMLHttpRequest for legacy requests + ad blocking
+          XMLHttpRequest.prototype.open = function(method, url) {
+            this.__purple_url = url;
+            this.__purple_method = method;
+            
+            // Block ad/tracking requests
+            if (shouldBlockRequest(url)) {
+              console.log('[Enhanced Adblock] XHR blocked:', url);
+              this.__purple_blocked = true;
+            }
+            
+            return originalXHROpen.apply(this, arguments);
+          };
+
+          XMLHttpRequest.prototype.send = function(body) {
+            const self = this;
+            const url = this.__purple_url;
+            
+            // Block if flagged
+            if (this.__purple_blocked) {
+              console.log('[Enhanced Adblock] XHR send blocked:', url);
+              return;
+            }
+            
+            if (url && url.includes('.m3u8')) {
+              const originalOnLoad = this.onload;
+              const originalOnReadyStateChange = this.onreadystatechange;
+              
+              this.addEventListener('load', function() {
+                if (self.responseType === '' || self.responseType === 'text') {
+                  try {
+                    const filtered = filterM3U8Playlist(self.responseText);
+                    Object.defineProperty(self, 'responseText', {
+                      value: filtered,
+                      writable: false
+                    });
+                    Object.defineProperty(self, 'response', {
+                      value: filtered,
+                      writable: false
+                    });
+                  } catch (e) {}
+                }
+              });
+            }
+            
+            return originalXHRSend.apply(this, arguments);
+          };
+
+          // Enhanced CSS blocking (inspired by uBlock Origin filters)
+          const adBlockCSS = `
+            /* Video ad elements */
+            [data-a-target="video-ad-countdown"],
+            [data-a-target="video-ad-label"],
+            [data-a-target="video-ad-overlay"],
+            [data-test-selector="video-ad"],
+            [class*="video-ads"],
+            [class*="VideoAd"],
+            [class*="video-ad"],
+            .video-ads,
+            .video-ad,
+            .video-ad__overlay,
+            .ad-container,
+            .ads-container,
+            
+            /* Ad banners & overlays */
+            [data-a-target="ad-banner"],
+            [data-test-selector="ad-banner"],
+            [data-test-selector="ad-overlay"],
+            [data-a-target="ad-overlay"],
+            .ad-overlay,
+            .ad-banner,
+            [id*="ad-banner"],
+            [id*="ad-overlay"],
+            [class*="AdBanner"],
+            [class*="ad-banner"],
+            
+            /* Twitch-specific ad elements */
+            [data-a-target*="ad-"],
+            [data-test-selector*="ad-"],
+            .tw-ad,
+            [class*="TwitchAd"],
+            [class*="twitch-ad"],
+            .channel-info-bar__ad,
+            
+            /* Sponsored content */
+            [data-a-target="sponsorship"],
+            [data-test-selector="sponsorship"],
+            .sponsored-content,
+            [class*="Sponsored"],
+            [class*="sponsored"],
+            
+            /* Promotional banners */
+            [data-a-target="promo-banner"],
+            [data-test-selector="promo-banner"],
+            .promo-banner,
+            [class*="PromoBanner"],
+            
+            /* Common ad patterns */
+            div[id^="ad-"],
+            div[id*="-ad-"],
+            div[id$="-ad"],
+            div[class^="ad-"],
+            div[class*="-ad-"],
+            div[class$="-ad"],
+            iframe[src*="/ad/"],
+            iframe[src*="/ads/"],
+            iframe[id*="ad"],
+            
+            /* Tracking pixels */
+            img[src*="tracking"],
+            img[src*="pixel"],
+            img[src*="beacon"],
+            img[width="1"][height="1"],
+            
+            /* Analytics */
+            [id*="analytics"],
+            [class*="analytics"],
+            script[src*="analytics"],
+            script[src*="tracking"] {
+              display: none !important;
+              visibility: hidden !important;
+              opacity: 0 !important;
+              pointer-events: none !important;
+              height: 0 !important;
+              width: 0 !important;
+              position: absolute !important;
+              left: -9999px !important;
+            }
+            
+            /* Remove ad spacing */
+            .ad-placeholder,
+            [data-test-selector="ad-placeholder"] {
+              display: none !important;
+              margin: 0 !important;
+              padding: 0 !important;
+            }
+          `;
+
+          if (!document.getElementById('enhanced-adblocker-style')) {
+            const style = document.createElement('style');
+            style.id = 'enhanced-adblocker-style';
+            style.textContent = adBlockCSS;
+            (document.head || document.documentElement).appendChild(style);
+          }
+          
+          // Block ad scripts from loading
+          const scriptObserver = new MutationObserver((mutations) => {
+            mutations.forEach((mutation) => {
+              mutation.addedNodes.forEach((node) => {
+                if (node.tagName === 'SCRIPT' && node.src && shouldBlockRequest(node.src)) {
+                  console.log('[Enhanced Adblock] Blocked script:', node.src);
+                  node.remove();
+                }
+                if (node.tagName === 'IFRAME' && node.src && shouldBlockRequest(node.src)) {
+                  console.log('[Enhanced Adblock] Blocked iframe:', node.src);
+                  node.remove();
+                }
+              });
+            });
+          });
+          scriptObserver.observe(document.documentElement, { childList: true, subtree: true });
+          
+          // Remove existing ad scripts
+          document.querySelectorAll('script').forEach((script) => {
+            if (script.src && shouldBlockRequest(script.src)) {
+              console.log('[Enhanced Adblock] Removed existing script:', script.src);
+              script.remove();
+            }
+          });
+          
+          // Remove existing ad iframes
+          document.querySelectorAll('iframe').forEach((iframe) => {
+            if (iframe.src && shouldBlockRequest(iframe.src)) {
+              console.log('[Enhanced Adblock] Removed existing iframe:', iframe.src);
+              iframe.remove();
+            }
+          });
+          
+          // Block Image.prototype.src setter for tracking pixels
+          const originalImageSrc = Object.getOwnPropertyDescriptor(Image.prototype, 'src');
+          if (originalImageSrc && originalImageSrc.set) {
+            Object.defineProperty(Image.prototype, 'src', {
+              set: function(value) {
+                if (shouldBlockRequest(value)) {
+                  console.log('[Enhanced Adblock] Blocked image:', value);
+                  return;
+                }
+                originalImageSrc.set.call(this, value);
+              },
+              get: originalImageSrc.get
+            });
+          }
+
+          // Monitor for ad indicators
+          let adCheckInterval = null;
+          function startAdMonitoring() {
+            if (adCheckInterval) return;
+            
+            adCheckInterval = setInterval(() => {
+              const adIndicators = document.querySelectorAll(
+                '[data-a-target="video-ad-countdown"], [data-a-target="video-ad-label"], .ad-overlay'
+              );
+              
+              if (adIndicators.length > 0) {
+                console.log('[Purple Adblock] Ad overlay detected, hiding...');
+                adIndicators.forEach(el => {
+                  el.style.display = 'none';
+                  el.style.visibility = 'hidden';
+                });
+              }
+            }, 500);
+          }
+
+          startAdMonitoring();
+          
+          // Aggressively remove ad elements every second
+          setInterval(() => {
+            // Remove any elements matching ad patterns
+            const adSelectors = [
+              '[data-a-target*="ad"]',
+              '[data-test-selector*="ad"]',
+              '[class*="ad-"]',
+              '[class*="Ad"]',
+              '[id*="ad-"]',
+              '.sponsored',
+              '[data-a-target="sponsorship"]'
+            ];
+            
+            adSelectors.forEach(selector => {
+              try {
+                const elements = document.querySelectorAll(selector);
+                elements.forEach(el => {
+                  // Only remove if it looks like an ad (not the main content)
+                  const text = (el.textContent || '').toLowerCase();
+                  if (text.includes('advertisement') || 
+                      text.includes('sponsored') || 
+                      text.includes('ad:') ||
+                      el.querySelector('iframe[src*="ad"]') ||
+                      el.className.match(/\\b(ad|ads|adv|banner|sponsor)\\b/i)) {
+                    el.remove();
+                  }
+                });
+              } catch (e) {}
+            });
+          }, 1000);
+
+          console.log('[Enhanced Adblock] Initialized successfully with uBlock-inspired rules');
+        })();
+        """,
+        injectionTime: .atDocumentStart,
+        forMainFrameOnly: true
+    )
+
+    private static let codecWorkaroundScript = WKUserScript(
+        source: """
+        (function() {
+          try {
+            const host = (location && location.host) ? location.host : '';
+            if (!host.endsWith('twitch.tv')) { return; }
+          } catch (_) {}
+
+          if (window.__twitchglass_codec_workaround) { return; }
+          window.__twitchglass_codec_workaround = true;
+
+          function shouldBlock(mime) {
+            if (!mime || typeof mime !== 'string') { return false; }
+            const lower = mime.toLowerCase();
+            return (
+              lower.includes('av01') ||
+              lower.includes('vp09') ||
+              lower.includes('vp8') ||
+              lower.includes('hvc1') ||
+              lower.includes('hev1')
+            );
+          }
+
+          try {
+            if (window.MediaSource && typeof MediaSource.isTypeSupported === 'function') {
+              const originalIsTypeSupported = MediaSource.isTypeSupported.bind(MediaSource);
+              MediaSource.isTypeSupported = function(mime) {
+                if (shouldBlock(mime)) { return false; }
+                return originalIsTypeSupported(mime);
+              };
+            }
+          } catch (_) {}
+
+          try {
+            const mc = navigator && navigator.mediaCapabilities;
+            if (mc && typeof mc.decodingInfo === 'function') {
+              const originalDecodingInfo = mc.decodingInfo.bind(mc);
+              mc.decodingInfo = async function(config) {
+                try {
+                  const videoType = config && config.video && config.video.contentType;
+                  const audioType = config && config.audio && config.audio.contentType;
+                  if (shouldBlock(videoType) || shouldBlock(audioType)) {
+                    return { supported: false, smooth: false, powerEfficient: false };
+                  }
+                } catch (_) {}
+                return originalDecodingInfo(config);
+              };
+            }
+          } catch (_) {}
+        })();
+        """,
+        injectionTime: .atDocumentStart,
+        forMainFrameOnly: true
+    )
+
+    private static let profileScript = WKUserScript(
+        source: """
+        (function() {
+          function cleanName(value) {
+            return (value || '')
+              .replace(/'s\\s+(channel|account)/i, '')
+              .replace(/profile\\s+picture/i, '')
+              .replace(/avatar/i, '')
+              .trim();
+          }
+
+          function isPlaceholder(value) {
+            if (!value) { return true; }
+            const lower = value.toLowerCase();
+            return (
+              lower === 'user' ||
+              lower === 'profile' ||
+              lower === 'account' ||
+              lower === 'avatar' ||
+              lower === 'user menu' ||
+              lower === 'menu'
+            );
+          }
+
+          function pickValue(value) {
+            const cleaned = cleanName(value);
+            return isPlaceholder(cleaned) ? '' : cleaned;
+          }
+
+          function mergeProfile(target, source) {
+            if (!source) { return target; }
+            if (!target.displayName && source.displayName) {
+              target.displayName = source.displayName;
+            }
+            if (!target.login && source.login) {
+              target.login = source.login;
+            }
+            return target;
+          }
+
+          function pickFromObject(obj) {
+            if (!obj || typeof obj !== 'object') { return {}; }
+            const displayName = pickValue(obj.displayName || obj.display_name || obj.name || obj.userDisplayName || obj.user_display_name);
+            const login = pickValue(obj.login || obj.username || obj.userLogin || obj.user_login);
+            if (displayName || login) {
+              return { displayName: displayName, login: login };
+            }
+            return {};
+          }
+
+          function extractFromState(state) {
+            if (!state || typeof state !== 'object') { return {}; }
+            const candidates = [
+              state.session && (state.session.user || state.session.currentUser || state.session.authenticatedUser),
+              state.auth && state.auth.user,
+              state.user,
+              state.currentUser,
+              state.viewer
+            ];
+            for (const candidate of candidates) {
+              const picked = pickFromObject(candidate);
+              if (picked.displayName || picked.login) {
+                return picked;
+              }
+            }
+            return {};
+          }
+
+          function extractFromConfig() {
+            const sources = [
+              window.__twilightSettings,
+              window.__TWILIGHT_SETTINGS__,
+              window.__TWITCH_SETTINGS__,
+              window.__twitch_settings__,
+              window.__twitchConfig,
+              window.__TwitchSettings
+            ];
+            for (const source of sources) {
+              const picked = pickFromObject(source);
+              if (picked.displayName || picked.login) {
+                return picked;
+              }
+              if (source && source.session) {
+                const fromSession = pickFromObject(source.session);
+                if (fromSession.displayName || fromSession.login) {
+                  return fromSession;
+                }
+              }
+            }
+            return {};
+          }
+
+          function extractFromApollo() {
+            const apollo = window.__APOLLO_STATE__;
+            if (!apollo || typeof apollo !== 'object') { return {}; }
+            const root = apollo['Query:ROOT'];
+            if (root) {
+              const pointer = root.currentUser || root.viewer || root.user || root.loggedInUser;
+              if (typeof pointer === 'string' && apollo[pointer]) {
+                const picked = pickFromObject(apollo[pointer]);
+                if (picked.displayName || picked.login) {
+                  return picked;
+                }
+              } else if (pointer && typeof pointer === 'object') {
+                const picked = pickFromObject(pointer);
+                if (picked.displayName || picked.login) {
+                  return picked;
+                }
+              }
+            }
+            return {};
+          }
+
+          function extractProfile() {
+            const loginButton = document.querySelector('[data-a-target="login-button"]');
+            const loggedIn = !loginButton;
+
+            let displayName = '';
+            let login = '';
+            let avatar = '';
+
+            const userMenu = document.querySelector('[data-a-target="user-menu-toggle"], [data-test-selector="user-menu-toggle"]');
+            if (userMenu) {
+              const img = userMenu.querySelector('img');
+              if (img && img.getAttribute('src')) {
+                avatar = img.getAttribute('src');
+              }
+              const alt = pickValue(img ? img.getAttribute('alt') : '');
+              if (alt) {
+                displayName = alt;
+              }
+              const label = pickValue(userMenu.getAttribute('aria-label') || userMenu.getAttribute('title'));
+              if (label && !displayName) {
+                displayName = label;
+              }
+            }
+
+            if (!displayName) {
+              const displayNode = document.querySelector('[data-a-target="user-display-name"], [data-test-selector="user-display-name"]');
+              if (displayNode) {
+                displayName = pickValue(displayNode.textContent || '');
+              }
+            }
+
+            let merged = { displayName: displayName, login: login };
+            merged = mergeProfile(merged, extractFromConfig());
+            merged = mergeProfile(merged, extractFromState(window.__INITIAL_STATE__));
+            merged = mergeProfile(merged, extractFromState(window.__TWITCH_STATE__));
+            merged = mergeProfile(merged, extractFromState(window.__STATE__));
+            merged = mergeProfile(merged, extractFromApollo());
+
+            window.webkit.messageHandlers.profile.postMessage({
+              displayName: (merged.displayName || '').trim(),
+              login: (merged.login || '').trim(),
+              avatar: avatar,
+              loggedIn: loggedIn ? 'true' : 'false'
+            });
+          }
+
+          extractProfile();
+          setInterval(extractProfile, 5000);
+        })();
+        """,
+        injectionTime: .atDocumentEnd,
+        forMainFrameOnly: true
+    )
+
+    private static let autoPlayScript = WKUserScript(
+        source: """
+        (function() {
+          if (window.__twitchglass_autoplay) { return; }
+          window.__twitchglass_autoplay = true;
+
+          function tryPlayOnce() {
+            const video = document.querySelector('video');
+            if (video && video.paused) {
+              video.play().catch(() => {});
+            }
+            const btn = document.querySelector('[data-a-target="player-play-pause-button"]');
+            if (btn) {
+              const label = (btn.getAttribute('aria-label') || '').toLowerCase();
+              if (label.includes('play')) {
+                btn.click();
+              }
+            }
+          }
+
+          tryPlayOnce();
+          setTimeout(tryPlayOnce, 1500);
+        })();
+        """,
+        injectionTime: .atDocumentEnd,
+        forMainFrameOnly: true
+    )
+}
